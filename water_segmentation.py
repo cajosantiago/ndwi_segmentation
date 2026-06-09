@@ -73,7 +73,7 @@ def main():
         default=2000,
         help="Minimum pixel area for NDWI mask post-processing"
     )
-    parser.add_add_argument(
+    parser.add_argument(
         "--filter",
         type=bool,
         default=False,
@@ -144,8 +144,8 @@ def main():
         print(f"[{idx}/{len(filtered_scenes)}] Processing {s['date']} ({s['filename']})...")
         
         # NDWI segmentation
-        ndwi_mask, _, estimated_elevation = segment_image(s['tif_path'], albufeira=args.albufeira, use_DEM=True)
-        elevation.append((s['date'], estimated_elevation))
+        ndwi_mask, _, result = segment_image(s['tif_path'], albufeira=args.albufeira, use_DEM=True)
+        elevation.append((s['date'], result['elevation']))
 
         # Save mask
         ndwi_mask_path = os.path.join(args.output_dir, f"{s['filename']}.png")
@@ -157,8 +157,6 @@ def main():
     print("="*80 + "\n")
 
     # save cota do csv
-    # create output folder
-    os.makedirs("data/excel/{}/".format(args.albufeira), exist_ok=True)
     df_p = pd.DataFrame(elevation, columns=["date", "elevation"])
 
     if args.filter and len(df_p) > 3:
@@ -172,8 +170,8 @@ def main():
             df_p.loc[df_p.index[-1], 'elevation'] = df_p['elevation'].iloc[-1]
 
     # Save csv timeseries
-    df_p.to_csv("data/excel/{}/predicted_elevation.csv".format(args.albufeira), index=False)
-    print("  → Saved elevation data to: data/excel/{}predicted_elevation.csv".format(args.albufeira))
+    df_p.to_csv(os.path.join(args.output_dir, "predicted_elevation.csv"), index=False)
+    print("  → Saved elevation data to: {}".format(os.path.join(args.output_dir, "predicted_elevation.csv")))
 
 if __name__ == "__main__":
     main()
