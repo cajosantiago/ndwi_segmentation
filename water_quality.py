@@ -1,16 +1,16 @@
 #!/opt/conda/bin/python3.11
 """
-generate_mago_images.py
+water_quality.py
 
 Generates MAGO water quality index images from local Sentinel-2 TIFF band files.
 Scans the bands directory directly (no index.json required) and filters by date range.
 
 Usage:
-    python generate_mago_images.py 2023-04-01
-    python generate_mago_images.py 2023-04-01_2023-05-31
-    python generate_mago_images.py 2023-04-01_2023-05-31 --max-cloud 30
-    python generate_mago_images.py 2023-04-01_2023-05-31 --albufeira Montargil
-    python generate_mago_images.py 2023-04-01_2023-05-31 --out-dir ./my_output
+    python water_quality.py 2023-04-01
+    python water_quality.py 2023-04-01_2023-05-31
+    python water_quality.py 2023-04-01_2023-05-31 --max-cloud 30
+    python water_quality.py 2023-04-01_2023-05-31 --albufeira Montargil
+    python water_quality.py 2023-04-01_2023-05-31 --out-dir ./my_output
 """
 
 import os
@@ -24,14 +24,17 @@ import matplotlib.colors as mcolors
 import cv2 as cv
 import tifffile
 from datetime import datetime, date
+from PIL import Image
+from estimate_elevation import segment_image
+from water_segmentation import scan_tif_files, load_band_idx
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
 DEFAULT_ALBUFEIRA     = "Maranhão"
-DEFAULT_BASE          = "/home/csantiago/data/Bandas/TWIN_STREAM_Maranhão"
-DEFAULT_MAX_CLOUD     = 20.0   # include all by default; user can tighten
+DEFAULT_CLOUD_THRESH  = 20.0   # maximum cloud cover % allowed
+DEFAULT_MIN_AREA      = 2000
 
-# ─── Index definitions (same as notebook) ────────────────────────────────────
+# ─── Index definitions ────────────────────────────────────────────────────────
 
 INDICES_TO_COMPUTE = [0, 3, 5, 6, 7]
 
@@ -57,19 +60,12 @@ INDEX_PRETTY = {
     7: "TSS [mg/L] (Soria-Perpinyà 2021)",
 }
 
-# Filename pattern: 20230404T113025Z_cc0.2pct_bands.tif
-TIF_RE = re.compile(
-    r"^(?P<ts>\d{8}T\d{6}Z)_cc(?P<cc>[\d.]+)pct_bands\.tif$"
-)
-
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def parse_date_arg(arg: str):
     """Return (start_date, end_date) as date objects from '2023-04-01' or '2023-04-01_2023-05-31'."""
     parts = arg.split("_")
     if len(parts) == 2:
-        # Could be a date range OR a single date that contains underscores (shouldn't happen)
-        # Try parsing as range first
         try:
             start = datetime.strptime(parts[0], "%Y-%m-%d").date()
             end   = datetime.strptime(parts[1], "%Y-%m-%d").date()
@@ -87,46 +83,12 @@ def parse_date_arg(arg: str):
         )
 
 
-def scan_tif_files(bands_dir: str):
-    """
-    Scan the bands directory for TIF files matching the expected naming convention.
-    Returns a list of dicts: {ts, date, cloud_cover, tif_path}
-    """
-    scenes = []
-    for fname in sorted(os.listdir(bands_dir)):
-        m = TIF_RE.match(fname)
-        if not m:
-            continue
-        ts_str     = m.group("ts")          # e.g. 20230404T113025Z
-        cc         = float(m.group("cc"))   # e.g. 0.2
-        date_str   = f"{ts_str[:4]}-{ts_str[4:6]}-{ts_str[6:8]}"
-        scenes.append({
-            "ts":          ts_str,
-            "date":        date_str,
-            "cloud_cover": cc,
-            "tif":         fname,
-        })
-    return scenes
-
-
-def load_band_idx(bands_dir: str):
-    """
-    Try to load band_idx from index.json; fall back to a hardcoded default
-    that matches the standard SentinelHub export order used by the project.
-    """
-    index_path = os.path.join(bands_dir, "index.json")
-    if os.path.exists(index_path):
-        with open(index_path) as f:
-            meta = json.load(f)
-        return meta["band_idx"]
-    # Fallback: standard order from the evalscript (B02 B03 B04 B05 B08 SCL)
-    print("[WARN] index.json not found — using default band order: B02=0 B03=1 B04=2 B05=3 B08=4 SCL=5")
-    return {"B02": 0, "B03": 1, "B04": 2, "B05": 3, "B08": 4, "SCL": 5}
-
-
-def compute_indices(tif_path: str, band_idx: dict):
-    """Read a TIFF and compute the 8 MAGO water quality indices."""
-    raw = tifffile.imread(tif_path).transpose(1, 2, 0).astype(np.float32)
+def compute_indices(tif_path: str, band_idx: dict, ndwi_mask: np.ndarray):
+    """Read a TIFF and compute the 8 MAGO water quality indices using the provided ndwi_mask."""
+    raw = tifffile.imread(tif_path)
+    if len(raw.shape) == 3:
+        raw = raw.transpose(1, 2, 0)
+    raw = raw.astype(np.float32)
 
     B02 = raw[:, :, band_idx["B02"]]
     B03 = raw[:, :, band_idx["B03"]]
@@ -135,12 +97,11 @@ def compute_indices(tif_path: str, band_idx: dict):
     B08 = raw[:, :, band_idx["B08"]]
     SCL = raw[:, :, band_idx["SCL"]].astype(np.uint8)
 
-    # Water / cloud masks
-    with np.errstate(invalid="ignore"):
-        NDWI = (B03 - B08) / (B03 + B08 + 1e-9)
-    water_mask = NDWI >= 0
+    # Cloud mask
     cloud_mask = np.isin(SCL, [1, 3, 8, 9, 10, 11])
-    valid_mask = water_mask & ~cloud_mask
+    
+    # Combined valid mask (water mask from segment_image and cloud-free)
+    valid_mask = (ndwi_mask > 0) & ~cloud_mask
 
     def make_band(arr):
         b = arr.copy().astype(np.float32)
@@ -166,10 +127,16 @@ def compute_indices(tif_path: str, band_idx: dict):
 
     all_bands = np.stack([i0, i1, i2, i3, i4, i5, i6, i7], axis=-1)
     n_water   = int(np.sum(valid_mask))
+    
+    # Calculate NDWI for return
+    with np.errstate(invalid="ignore", divide="ignore"):
+        NDWI = (B03 - B08) / (B03 + B08 + 1e-9)
+    NDWI = np.nan_to_num(NDWI, nan=-1.0)
+    
     return all_bands, n_water, NDWI, valid_mask
 
 
-def save_index_image(band_2d, idx_num, albufeira, date_str, ts_str, cc_tag, out_dir):
+def save_index_image(band_2d, idx_num, albufeira, date_str, ts_str, cc_tag, out_dir, min_area=2000):
     """Apply small-area filter, render and save one index image."""
     mago_colors = ["blue", "cyan", "green", "yellow", "red"]
     mago_cmap   = mcolors.LinearSegmentedColormap.from_list("mago", mago_colors)
@@ -182,13 +149,13 @@ def save_index_image(band_2d, idx_num, albufeira, date_str, ts_str, cc_tag, out_
         print(f"    [{label}] — sem pixels válidos, ignorado.")
         return
 
-    # Remove small disconnected regions (Guilherme's filter, min 2000 px)
+    # Remove small disconnected regions (Guilherme's filter)
     valid_mask_img = np.isfinite(band)
     binary = (valid_mask_img.astype(np.uint8)) * 255
     n_lbl, lbl_cv, stats, _ = cv.connectedComponentsWithStats(binary, connectivity=8)
     clean_mask = np.zeros(binary.shape, dtype=np.uint8)
     for i in range(1, n_lbl):
-        if stats[i, cv.CC_STAT_AREA] >= 2000:
+        if stats[i, cv.CC_STAT_AREA] >= min_area:
             clean_mask[lbl_cv == i] = 1
     band[clean_mask == 0] = np.nan
 
@@ -219,7 +186,6 @@ def save_index_image(band_2d, idx_num, albufeira, date_str, ts_str, cc_tag, out_
     fname_nb = os.path.join(out_dir, f"{ts_str}_{cc_tag}_{label}_nb.png")
     plt.imsave(fname_nb, band, cmap=mago_cmap, vmin=vmin, vmax=vmax)
     print(f"    → {os.path.basename(fname_nb)}")
-
 
 
 def save_ndwi_image(ndwi, albufeira, date_str, ts_str, cc_tag, out_dir):
@@ -278,22 +244,32 @@ def main():
         help=f"Reservoir name used in titles and output folder (default: {DEFAULT_ALBUFEIRA})",
     )
     parser.add_argument(
-        "--base",
-        default=DEFAULT_BASE,
-        help=f"Base directory containing input/bands/ (default: {DEFAULT_BASE})",
+        "--use-dem",
+        type=bool,
+        default=False,
+        help="Use DEM to improve segmentation"
     )
     parser.add_argument(
-        "--max-cloud",
-        type=float,
-        default=DEFAULT_MAX_CLOUD,
-        dest="max_cloud",
-        help=f"Maximum cloud cover %% to include (default: {DEFAULT_MAX_CLOUD} = all)",
-    )
-    parser.add_argument(
-        "--out-dir",
+        "--input-dir",
         default=None,
-        dest="out_dir",
-        help="Output directory for images (default: MAGO_<albufeira>_imgs/)",
+        help="Input folder with bands TIFF files"
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output directory for images (default: generated_data/quality/<albufeira>/)",
+    )
+    parser.add_argument(
+        "--cloud-threshold",
+        type=float,
+        default=DEFAULT_CLOUD_THRESH,
+        help=f"Maximum cloud cover %% to include (default: {DEFAULT_CLOUD_THRESH}%)",
+    )
+    parser.add_argument(
+        "--min-area",
+        type=int,
+        default=DEFAULT_MIN_AREA,
+        help=f"Minimum pixel area for NDWI mask post-processing (default: {DEFAULT_MIN_AREA})",
     )
     parser.add_argument(
         "--save-masks",
@@ -313,81 +289,133 @@ def main():
 
     start_str = start_date.strftime("%Y-%m-%d")
     end_str   = end_date.strftime("%Y-%m-%d")
-    print(f"\n{'═'*60}")
-    print(f"  MAGO image generator")
-    print(f"  Albufeira : {args.albufeira}")
-    print(f"  Intervalo : {start_str} → {end_str}")
-    print(f"  Cloud max : {args.max_cloud}%")
-    print(f"  Índices   : {[INDEX_LABELS[i] for i in INDICES_TO_COMPUTE]}")
-    print(f"  Guardar máscaras (NDWI, valid_mask): {'sim' if args.save_masks else 'não'}")
-    print(f"{'═'*60}\n")
 
-    # ── Locate bands directory ────────────────────────────────────────────────
-    bands_dir = os.path.join(args.base, "input", "bands")
-    if not os.path.isdir(bands_dir):
-        print(f"[ERROR] Bands directory not found: {bands_dir}", file=sys.stderr)
+    # Set up default paths if not provided
+    if args.input_dir is None:
+        args.input_dir = f"/home/csantiago/data/sentinelhub/Bandas/{args.albufeira}"
+    
+    if args.output_dir is None:
+        args.output_dir = f"/home/csantiago/generated_data/quality/{args.albufeira}"
+
+    print(f"\n{'═'*80}")
+    print(f"  MAGO WATER QUALITY INDEX PIPELINE")
+    print(f"{'═'*80}")
+    print(f"  Albufeira  : {args.albufeira}")
+    print(f"  Interval   : {start_str} → {end_str}")
+    print(f"  Cloud Thresh: {args.cloud_threshold}%")
+    print(f"  Min Area   : {args.min_area} px")
+    print(f"  Use DEM    : {args.use_dem}")
+    print(f"  Input Dir  : {args.input_dir}")
+    print(f"  Output Dir : {args.output_dir}")
+    print(f"  Save Masks : {'yes' if args.save_masks else 'no'}")
+    print(f"{'═'*80}\n")
+
+    # ── Verify and scan bands directory ───────────────────────────────────────
+    if not os.path.isdir(args.input_dir):
+        print(f"[ERROR] Input directory not found: {args.input_dir}", file=sys.stderr)
         sys.exit(1)
 
     # ── Load band index ───────────────────────────────────────────────────────
-    band_idx = load_band_idx(bands_dir)
+    band_idx = load_band_idx(args.input_dir)
+    if "B03" not in band_idx or "B08" not in band_idx or "SCL" not in band_idx:
+        print("[ERROR] Required bands (B03, B08, SCL) not found. Aborting.", file=sys.stderr)
+        sys.exit(1)
 
     # ── Scan all TIF files in the folder ─────────────────────────────────────
-    all_scenes = scan_tif_files(bands_dir)
-    print(f"TIF files found in folder : {len(all_scenes)}")
-
-    # ── Filter by date range and cloud cover ──────────────────────────────────
-    scenes = [
-        s for s in all_scenes
-        if start_str <= s["date"] <= end_str
-        and s["cloud_cover"] <= args.max_cloud
-    ]
-    print(f"Cenas no intervalo (cloud ≤ {args.max_cloud}%) : {len(scenes)}\n")
-
+    scenes = scan_tif_files(args.input_dir)
     if not scenes:
-        print("Nenhuma cena encontrada no intervalo especificado.")
+        print(f"[ERROR] No valid TIFF files matching pattern found in: {args.input_dir}")
+        sys.exit(1)
+
+    print(f"Discovered {len(scenes)} total TIFF files in input folder.")
+
+    # ── Filter by date range first ────────────────────────────────────────────
+    date_filtered_scenes = [
+        s for s in scenes
+        if start_str <= s["date"] <= end_str
+    ]
+    print(f"Scenes within date range ({start_str} to {end_str}): {len(date_filtered_scenes)}")
+
+    if not date_filtered_scenes:
+        print("No scenes found in the specified date range.")
+        sys.exit(0)
+
+    # ── Filter by cloud cover (Local SCL) ─────────────────────────────────────
+    filtered_scenes = []
+    print("\n--- Cloud Cover Comparison and Filtering Analysis ---")
+    print(f"{'Date':12s} | {'Filename':35s} | {'Global (File)%':15s} | {'Local (SCL)%':12s} | {'Decision':10s}")
+    print("-" * 95)
+    
+    for s in date_filtered_scenes:
+        try:
+            raw_scl = tifffile.imread(s["tif_path"], key=band_idx["SCL"]).astype(np.uint8)
+            cloud_mask = np.isin(raw_scl, [1, 3, 8, 9, 10, 11])
+            scl_cloud_pct = (np.sum(cloud_mask) / raw_scl.size) * 100.0
+        except Exception as e:
+            print(f"Error reading SCL band for {s['filename']}: {e}")
+            scl_cloud_pct = 100.0
+            
+        s["local_cloud"] = scl_cloud_pct
+        if scl_cloud_pct <= args.cloud_threshold:
+            decision = "INCLUDE"
+            filtered_scenes.append(s)
+        else:
+            decision = "EXCLUDE"
+            
+        print(f"{s['date']:12s} | {s['filename'][:35]:35s} | {s['filename_cloud']:14.2f}% | {s['local_cloud']:11.2f}% | {decision:10s}")
+        
+    print("-" * 95)
+    print(f"Total scenes included: {len(filtered_scenes)} / {len(date_filtered_scenes)}\n")
+    
+    if not filtered_scenes:
+        print("No scenes remaining after cloud filtering. Exiting.")
         sys.exit(0)
 
     # ── Output directory ──────────────────────────────────────────────────────
-    out_dir = args.out_dir or f"MAGO_{args.albufeira}_imgs"
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"Imagens guardadas em: {out_dir}\n")
+    os.makedirs(args.output_dir, exist_ok=True)
+    print(f"Images will be saved to: {args.output_dir}\n")
 
     # ── Process each scene ────────────────────────────────────────────────────
-    for scene_idx, scene in enumerate(scenes, start=1):
-        date_str    = scene["date"]
-        ts_str      = scene["ts"]
-        cloud_cover = scene["cloud_cover"]
-        tif_path    = os.path.join(bands_dir, scene["tif"])
+    for scene_idx, s in enumerate(filtered_scenes, start=1):
+        date_str    = s["date"]
+        ts_str      = s["ts"]
+        cloud_cover = s["local_cloud"]
+        tif_path    = s["tif_path"]
         cc_tag      = f"cc{cloud_cover:.1f}pct"
 
-        print(f"[{scene_idx:03d}/{len(scenes)}] {date_str}  (cloud={cloud_cover:.1f}%)", end=" ... ")
-
-        if not os.path.exists(tif_path):
-            print("TIFF não encontrado — ignorado.")
-            continue
+        print(f"[{scene_idx:03d}/{len(filtered_scenes)}] Processing {date_str} (cloud={cloud_cover:.1f}%)...")
 
         try:
-            all_bands, n_water, ndwi, valid_mask = compute_indices(tif_path, band_idx)
+            # 1. Run the segmentation pipeline to obtain the water mask (using reuse of segment_image)
+            ndwi_mask, _, result = segment_image(
+                tif_path, 
+                albufeira=args.albufeira, 
+                use_DEM=args.use_dem, 
+                min_area=args.min_area
+            )
+            
+            # 2. Compute the water quality indices using the segmented mask
+            all_bands, n_water, ndwi, valid_mask = compute_indices(tif_path, band_idx, ndwi_mask)
         except Exception as exc:
-            print(f"ERRO ao ler TIFF: {exc}")
+            print(f"  [ERROR] Processing scene: {exc}")
             continue
 
         if n_water == 0:
-            print("0 pixels de água válidos — cena ignorada.")
+            print("  → 0 pixels of valid water — scene ignored.")
             continue
 
-        print(f"OK ({n_water} px água)")
+        print(f"  → OK ({n_water} px water)")
 
         if args.save_masks:
-            save_ndwi_image(ndwi, args.albufeira, date_str, ts_str, cc_tag, out_dir)
-            save_valid_mask_image(valid_mask, args.albufeira, date_str, ts_str, cc_tag, out_dir)
+            save_ndwi_image(ndwi, args.albufeira, date_str, ts_str, cc_tag, args.output_dir)
+            save_valid_mask_image(valid_mask, args.albufeira, date_str, ts_str, cc_tag, args.output_dir)
 
         for idx_num in INDICES_TO_COMPUTE:
             band_2d = all_bands[:, :, idx_num]
             save_index_image(band_2d, idx_num, args.albufeira,
-                             date_str, ts_str, cc_tag, out_dir)
+                             date_str, ts_str, cc_tag, args.output_dir, min_area=args.min_area)
 
-    print(f"\nConcluído. Imagens guardadas em: {out_dir}")
+    print(f"\nConcluído. Imagens guardadas em: {args.output_dir}")
 
 
 if __name__ == "__main__":
