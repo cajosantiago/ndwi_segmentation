@@ -11,8 +11,8 @@
 #        /app/generated_data   - Optional: DEM data (SAM.npy/DEM.npy files)
 #        /app/data             - Optional: Output predicted elevation CSVs
 #
-#  Build example:
-#        docker build -t water-segmentation -f docker/Dockerfile docker/
+#  Build example (run from the repository root):
+#        docker build -t water-segmentation -f docker/Dockerfile .
 #
 #  Run example (using local directories):
 #        docker run --rm \
@@ -54,7 +54,6 @@ RUN pip install --no-cache-dir \
 
 # Copy the Python scripts and assign ownership to the non-root user
 COPY --chown=appuser:appgroup water_segmentation.py estimate_elevation.py ./
-COPY --chown=appuser:appgroup ./DEM/DEM.npy ./DEM/SAM.npy ./
 
 # Switch to the non-root user
 USER appuser
